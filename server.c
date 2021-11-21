@@ -73,13 +73,6 @@ void list_files(int conn_fd)
     }
 }
 
-typedef struct {
-    int id;          //902001-902020
-    int AZ;          
-    int BNT;         
-    int Moderna;     
-}registerRecord;
-
 int handle_read(request* reqP) {
     int r;
     char buf[512];
@@ -118,9 +111,7 @@ int main(int argc, char** argv) {
     int file_fd;  // fd for file that we open for reading
     char buf[512];
     int buf_len;
-    struct flock lock;
-    bool write_lock = false;
-    bool read_lock = false;
+    
 
     int status = mkdir("server_folder",0777);
     if(status == -1)
@@ -413,7 +404,5 @@ int parsing_request(int conn_fd,request* reqP,char* filepath,char* filename)
         return 1;
     if(strcmp("put",op)==0)
         return 2;
-    
-
     
 }
