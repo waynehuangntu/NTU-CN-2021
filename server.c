@@ -16,10 +16,22 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
+#include <signal.h>
 
 
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
 #define GET_VARIABLE_NAME(Variable) (#Variable)
+#define WAIT_FOR_OPERATION 0
+#define WAIT_FOR_DATA_SIZE 1
+#define WAIT_FOR_DATA 2
+#define WAIT_FOR_NAME 3
+#define PROCESSING_GET 4
+#define PROCESSING_PUT 5
+#define PROCESSING_LS 6
+#define BUFSIZE 1024
+#define SIGPIPE 13
+#define SIG_IGN ((__sighandler_t) 1)
+
 
 typedef struct {
     char hostname[512];  // server's hostname
@@ -30,16 +42,21 @@ typedef struct {
 typedef struct {
     char host[512];  // client's host
     int conn_fd;  // fd to talk with client
-    char buf[512];  // data sent by/to client
+    char buf[BUFSIZE];  // data sent by/to client
     size_t buf_len;  // bytes used by buf
-    // you don't need to change this.
+    char file_path[50];
     char username[10];
+    char operation[10];
+    int status;
+    ssize_t filesize;
+    off_t offset;
     int wait_for_write;  // used by handle_read to know if the header is read or not.
 } request;
 
 server svr;  // server
 request* requestP = NULL;  // point to a list of requests
 int maxfd;  // size of open file descriptor table, size of request list
+int max_fd;
 
 const char* accept_read_header = "ACCEPT_FROM_READ";
 const char* accept_write_header = "ACCEPT_FROM_WRITE";
@@ -55,23 +72,67 @@ static void free_request(request* reqP);
 
 int get_username(int conn_fd,request* reqP);
 int parsing_request(int conn_fd,request* reqP,char* filepath,char* filename);
+void get_operation(int conn_fd,char* file_path);
+void put_operation(int conn_fd,char* file_path,ssize_t numbytes);
+int send_msg(int conn_fd,char* msg)
+{
+    char buffer[BUFSIZE];
+    bzero(buffer,sizeof(buffer));
+    strcpy(buffer,msg);
+    write(conn_fd,buffer,sizeof(buffer));
+    fprintf(stderr,"####Server sending %s to client %d\n",buffer,conn_fd);
+}
+
+void sort(char arr[][50],int num)
+{
+    char tmp[50] = {0};
+    for(int i=0;i<num;i++)
+    {
+        for(int j = i+1;j<num;j++)
+        {
+            if(strcmp(arr[i],arr[j]) > 0)
+            {
+                strcpy(tmp,arr[i]);
+                strcpy(arr[i],arr[j]);
+                strcpy(arr[j],tmp);
+            }
+        }
+    }
+}
 
 void list_files(int conn_fd)
 {
     DIR *d;
     struct dirent *dir;
-    char buffer[100];
-    d = opendir("./server_folder");
+    char buffer[BUFSIZE];
+    bzero(buffer,sizeof(buffer));
+    char arr[100][50] = {0};
+    int num = 0;
+    d = opendir("./server_dir");
+
     if (d)
     {
         while ((dir = readdir(d)) != NULL)
         {
-            sprintf(buffer,"%s\n", dir->d_name);
-            write(conn_fd,buffer,sizeof(buffer));
+            
+            if(dir->d_type == DT_REG)
+            {
+                strcpy(arr[num],dir->d_name);
+                num++;
+            }    
         }
-        closedir(d);
     }
+    sort(arr,num);
+    for(int i=0;i<num;i++)
+    {
+        sprintf(buffer+strlen(buffer),"%s\n",arr[i]);
+    }
+    fprintf(stderr,"listing file:\n");
+    fprintf(stderr,"%s",buffer);
+    send_msg(conn_fd,buffer);
+    closedir(d);
 }
+
 
 int handle_read(request* reqP) {
     int r;
@@ -84,7 +145,7 @@ int handle_read(request* reqP) {
     char* p1 = strstr(buf, "\015\012");
     int newline_len = 2;
     if (p1 == NULL) {
-       p1 = strstr(buf, "\012");
+        p1 = strstr(buf, "\012");
         if (p1 == NULL) {
             ERR_EXIT("this really should not happen...");
         }
@@ -109,24 +170,33 @@ int main(int argc, char** argv) {
 
     int conn_fd;  // fd for a new connection with client
     int file_fd;  // fd for file that we open for reading
-    char buf[512];
+    char buf[BUFSIZE];
     int buf_len;
     
+    DIR* dp;
+    dp = opendir("server_dir");
+    if(errno == ENOENT)
+    {
+        int status = mkdir("server_dir",0777);
+        if(status == -1)
+            fprintf(stderr,"fail to create directory\n");
+        else
+            fprintf(stderr,"the server folder has been created\n");
+    }
 
-    int status = mkdir("server_folder",0777);
-    if(status == -1)
-        fprintf(stderr,"fail to crearte directory");
-    
     // Initialize server
     init_server((unsigned short) atoi(argv[1]));
+    fprintf(stderr,"the server has been initialized\n");
+    signal(SIGPIPE,SIG_IGN);
     
     // Loop for handling connections
-    fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
+    //fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
     struct timeval tv;
-    struct fd_set original_set,workingset;
+    fd_set original_set,workingset;
     FD_ZERO(&original_set);
     FD_SET(svr.listen_fd,&original_set);
+    max_fd = svr.listen_fd;
 
     while (1) 
     {
@@ -135,7 +205,7 @@ int main(int argc, char** argv) {
         tv.tv_usec = 0;
         //memcpy(&workingset,&original_set,sizeof(original_set));
         workingset = original_set;
-        int ret = select(maxfd,&workingset,NULL,NULL,&tv); 
+        int ret = select(max_fd+1,&workingset,NULL,NULL,&tv); 
         if(ret< 0)
         {
             fprintf(stderr,"select error \n");
@@ -149,7 +219,7 @@ int main(int argc, char** argv) {
         }
        
         /*如果不用select "accept為slow syscall process may be blocked eternally, so we use select to make sure the reading data  is ready*/
-       for(int i = 0;i<maxfd;i++)
+       for(int i = 0;i<max_fd+1;i++)
        {
             if(FD_ISSET(i,&workingset))
             {
@@ -170,97 +240,130 @@ int main(int argc, char** argv) {
                     else // accept succeed
                     {
                         fprintf(stderr,"New connection incoming%d\n",conn_fd);
-                        FD_SET(conn_fd,&original_set);
+                        FD_SET(conn_fd,&original_set); 
+                        if(conn_fd > max_fd)
+                            max_fd = conn_fd;
                         // Check new connection
                         requestP[conn_fd].conn_fd = conn_fd;
                         strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
-                        fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
-                        char* entry_buf = "input your username:\n";
-                        write(conn_fd,entry_buf,strlen(entry_buf));
                     }
                 }
 
                 else // data from existing connection not establishing new connection, receive it
                 {
                     
-                    
-                    int ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
-	                if (ret < 0) {
-                        fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
+                    memset(requestP[i].buf,'\0',BUFSIZE);
+                    ssize_t numbytes = read(i,requestP[i].buf,BUFSIZE);
+                    if (numbytes == 0)
+                    {
+                        FD_CLR(requestP[i].conn_fd,&original_set);
+                        close(requestP[i].conn_fd);
+                        free_request(&requestP[i]);
+                        fprintf(stderr,"client %d has left\n",i);
+                        continue;
+
+                    }
+                    else if (numbytes < 0){
+                        fprintf(stderr, "bad request from %s\n", requestP[i].host);
                         continue;
                     }
-                    
-                    if(requestP[conn_fd].username == NULL)
+                    else{
+                        fprintf(stderr,"request from %d request is %s\n",requestP[i].conn_fd,requestP[i].buf);
+                    }
+
+                    switch (requestP[i].status)
                     {
-                        int ret = get_username(conn_fd,requestP);
+                    case WAIT_FOR_NAME: ;
+                        /* code */
+                        int ret = get_username(requestP[i].conn_fd,requestP);
                         if(ret > 0)
                             continue; // username in used;
+                        else //username not in used
+                        {
+                            strcpy(requestP[i].username,requestP[i].buf);
+                            strcpy(requestP[i].buf,"connect successfully");
+                            send_msg(i,requestP[i].buf);
+                            requestP[i].status = WAIT_FOR_OPERATION;
+                            //continue;
+                        }
+                        break;
+                    case WAIT_FOR_OPERATION: ;
+                        char file_path[100] = "./server_dir/";
+                        char filename[100];
+                        int parsing = parsing_request(requestP[i].conn_fd,requestP,file_path,filename);
+                        if(parsing == 0)//ls operatration from client
+                        {
+                            list_files(requestP[i].conn_fd);
+                        }
+                        else if (parsing == 1) // get operation from client
+                        {
+                            if(access(file_path,F_OK)!=0) //file does not exist
+                            {
+                                sprintf(requestP[i].buf,"%d",-1);
+                                send_msg(i,requestP[i].buf);
+                            }
+                            else
+                            {
+                                struct stat st;
+                                stat(file_path,&st);
+                                int size = st.st_size;
+
+
+                                //sending file size
+                                sprintf(requestP[i].buf,"%d",size);
+                                send_msg(i,requestP[i].buf);
+            
+                                requestP[i].filesize = size;
+                                requestP[i].status = PROCESSING_GET;
+                                requestP[i].offset = 0;
+                                strcpy(requestP[i].file_path,file_path);
+                            }
+                            
+            
+                        }
+
+                        else if(parsing == 2)//put operation from client
+                        {
+                          
+                            requestP[i].status = WAIT_FOR_DATA_SIZE;
+                            strcpy(requestP[i].file_path,file_path);
+                        }
+                        break;
+                        
+                    case WAIT_FOR_DATA_SIZE:
+                        requestP[i].filesize = atoi(requestP[i].buf);
+                        requestP[i].status = PROCESSING_PUT;
+                        break;
+
+                    case PROCESSING_PUT: 
+                        fprintf(stderr,"In PROCESSING_PUT\n");
+                        put_operation(i,file_path,numbytes);
+                        if(requestP[i].filesize == 0)
+                        {
+                            requestP[i].status = WAIT_FOR_OPERATION;
+                            memset(requestP[i].file_path,0,sizeof(requestP[i].file_path));
+                        }
+                        break;
+                    case PROCESSING_GET:
+                        
+                        if(strcmp("Finished get operation",requestP[i].buf) ==0)
+                        {
+                            requestP[i].status = WAIT_FOR_OPERATION;
+                            memset(requestP[i].file_path,0,sizeof(requestP[i].file_path));
+                
+                        }
                         else
                         {
-                            strcpy(requestP[conn_fd].buf,"connect successfully\n");
-                            requestP[conn_fd].buf_len = strlen(requestP[conn_fd].buf);
-                            write(conn_fd,requestP[conn_fd].buf,requestP[conn_fd].buf_len);
-                            continue;
+                            get_operation(i,file_path);
                         }
-                    }
+                        break;      
+                        
 
-                    char* file_path;
-                    char* filename;
-                    int ret = parsing_request(conn_fd,requestP,file_path,filename);
-                    if(ret == 0)//ls operatration from client
-                    {
-                        list_file(conn_fd);
+                    default:
+                        break;
                     }
-                
-                    else if(ret == 1) // get operation from client
-                    {
-                        
-                        struct stat st;
-                        stat(file_path,&st);
-                        int size = st.st_size;
-                        int fd = open(file_path,O_RDONLY);
-                        if(fd == -1)
-                            perror("File open Error");
-                        
-                        int ret = sendfile(conn_fd,fd,NULL,size);
-                        if(ret < 0)
-                            perror("Sendfile Error:");
-                        fprintf(stderr,"file sended to client\n");
-                        sprintf(requestP[conn_fd].buf,"get <%s> successfully\n",filename);
-                        write(conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
-                        close(fd);
+                    
 
-                    }
-                    else if(ret == 2)// put operation from client
-                    {
-                        
-                        char buffer[1024];
-                        FILE* received_file = fopen(file_path,"w");
-                        if(received_file == NULL)
-                            perror("File open error:");
-                        struct stat st;
-                        stat(file_path,&st);
-                        int remain_data = st.st_size;
-                        int len;
-                        while((remain_data > 0)&& (len = read(conn_fd,buffer,sizeof(buffer) > 0)))
-                        {
-                            fwrite(buffer, sizeof(char), len, received_file);
-                            remain_data -= len;
-                        }
-                        fprintf(stderr,"file received from client\n");
-                        sprintf(requestP[conn_fd].buf,"put <%s> successfully\n",filename);
-                        write(conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
-                        fclose(received_file);
-                    }
-                    else //invalid operation
-                    {
-                        continue;
-                    }
-                    /*
-                    close(requestP[conn_fd].conn_fd);
-                    free_request(&requestP[conn_fd]);
-                    FD_CLR(i,&original_set);
-                    */
                 }
             }
        }
@@ -275,11 +378,12 @@ int main(int argc, char** argv) {
 
 static void init_request(request* reqP) {
     reqP->conn_fd = -1;
-    reqP->buf_len = 0;
-    strcpy(reqP->username,NULL);
-    
+    reqP->buf_len = 0; 
+    reqP->status = WAIT_FOR_NAME;
+    reqP->offset = 0;
+    memset(reqP->username,0,sizeof(reqP->username));
+    memset(reqP->file_path,0,sizeof(reqP->file_path));
 }
-
 static void free_request(request* reqP) {
     /*if (reqP->filename != NULL) {
         free(reqP->filename);
@@ -315,44 +419,47 @@ static void init_server(unsigned short port) {
 
     // Get file descripter table size and initialize request table
     maxfd = getdtablesize();
+    
     requestP = (request*) malloc(sizeof(request) * maxfd);
     if (requestP == NULL) {
         ERR_EXIT("out of memory allocating all requests");
     }
+    fprintf(stderr,"starting initializing requests\n");
     for (int i = 0; i < maxfd; i++) {
         init_request(&requestP[i]);
     }
+    fprintf(stderr,"the requests has bee initialized\n");
+    fprintf(stderr,"svr.listen_fd = %d\n",svr.listen_fd);
     requestP[svr.listen_fd].conn_fd = svr.listen_fd;
     strcpy(requestP[svr.listen_fd].host, svr.hostname);
+    fprintf(stderr,"hostname has been copied\n");
 
     return;
 }
 
 int get_username(int conn_fd,request* reqP)
 {
-    char* username = requestP[conn_fd].buf;
+    char* username = reqP[conn_fd].buf;
     int dup_username = 0;
-    for(int i =0;i<maxfd;i++){
-        if(strcmp(requestP[i].username,username))
+    for(int i =0;i<max_fd+1;i++){
+        if(strcmp(reqP[i].username,username) == 0)
         {
-            strcpy(requestP[conn_fd].buf,"username is in used, please try another:\n");
-            requestP[conn_fd].buf_len = strlen(requestP[conn_fd].buf);
-            write(conn_fd,requestP[conn_fd].buf,requestP[conn_fd].buf_len);
+            strcpy(reqP[conn_fd].buf,"username is in used, please try another:\n");
+            send_msg(conn_fd,reqP[conn_fd].buf);
             dup_username = 1;
             break;
         }
     }
-    
     return dup_username;
 }
 
 int parsing_request(int conn_fd,request* reqP,char* filepath,char* filename)
 {
     char* req = reqP[conn_fd].buf;
-    char op[10];
+    char op[20];
     char file[100];
-    char file_path[100] = "./server_folder/";
-    char parse_result[2][20];
+    //char file_path[100] = "./server_dir/";
+    char parse_result[10][50];
     int index = 0;
     char* delim = " ";
     char* p = strtok(req,delim);
@@ -363,46 +470,50 @@ int parsing_request(int conn_fd,request* reqP,char* filepath,char* filename)
         p = strtok(NULL,delim);
     }
     
-
-    //format checking
-    if(index != 2 || index !=1)
-    {
-        strcpy(reqP[conn_fd].buf , "Command format error\n");
-        reqP[conn_fd].buf_len = strlen(reqP[conn_fd].buf);
-        write(conn_fd,reqP[conn_fd].buf,reqP[conn_fd].buf_len);
-        return -1;
-    }
-
-    strcpy(op,parsing_request[0]);
-    strcpy(filename,parsing_request[1]);
-    strcat(file_path,filename);
-
+    strcpy(filename,parse_result[1]);
+    strcat(filepath,filename);
+    
     //command checking
-    if(strcmp(op,"get")!=0 && strcmp(op,"put")!=0 && strcmp(op,"ls")!=0)
-    {
-        strcpy(reqP[conn_fd].buf , "Command not found\n");
-        reqP[conn_fd].buf_len = strlen(reqP[conn_fd].buf);
-        write(conn_fd,reqP[conn_fd].buf,reqP[conn_fd].buf_len);
-        return -1;
-    }
-
-    if(strcmp("ls",op)==0)
+    
+    if(strcmp("ls",parse_result[0])==0)
         return 0;
 
-    //file checking
-    
-    if(access(file_path,F_OK)!=0)
+    if(strcmp("get",parse_result[0])==0)
     {
-        sprintf(reqP[conn_fd].buf,"The '%s' doesn't exist\n",file);
-        reqP[conn_fd].buf_len = strlen(reqP[conn_fd].buf);
-        write(conn_fd,reqP[conn_fd].buf,reqP[conn_fd].buf_len);
-        return -1;
-    }
-
-    filepath = file_path;
-    if(strcmp("get",op)==0)
         return 1;
-    if(strcmp("put",op)==0)
+    }
+    if(strcmp("put",parse_result[0])==0)
         return 2;
-    
+}
+
+
+void get_operation(int conn_fd,char* file_path)
+{
+    char buf[BUFSIZE];
+    int fd = open(requestP[conn_fd].file_path,O_RDONLY);
+    if(fd == -1)
+        perror("File open Error");
+
+    lseek(fd,requestP[conn_fd].offset,SEEK_SET);
+    bzero(buf,sizeof(buf));
+    ssize_t readbytes = read(fd,buf,BUFSIZE);
+    ssize_t writebytes = write(conn_fd,buf,readbytes);
+    fprintf(stderr,"-----Server sending data = %s to client %d\n",buf,conn_fd);
+    requestP[conn_fd].offset += writebytes;
+    requestP[conn_fd].filesize -= writebytes;
+    fprintf(stderr,"Server send %ld bytes from files data and remaining data = %ld\n",writebytes,requestP[conn_fd].filesize);
+    close(fd);
+}
+
+void put_operation(int conn_fd,char* file_path,ssize_t numbytes)
+{
+    FILE* received_file;
+    received_file = fopen(requestP[conn_fd].file_path,"a");
+    if(received_file == NULL)
+        perror("File open error:");
+
+    fwrite(requestP[conn_fd].buf,sizeof(char),numbytes,received_file);
+    requestP[conn_fd].filesize -= numbytes;
+    fprintf(stderr,"Receive %ld bytes and we hope :- %ld bytes\n", numbytes, requestP[conn_fd].filesize);
+    fclose(received_file);
 }
