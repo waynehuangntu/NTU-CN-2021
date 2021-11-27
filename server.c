@@ -72,8 +72,8 @@ static void free_request(request* reqP);
 
 int get_username(int conn_fd,request* reqP);
 int parsing_request(int conn_fd,request* reqP,char* filepath,char* filename);
-void get_operation(int conn_fd,char* file_path);
-void put_operation(int conn_fd,char* file_path,ssize_t numbytes);
+void get_operation(int conn_fd);
+void put_operation(int conn_fd,ssize_t numbytes);
 int send_msg(int conn_fd,char* msg)
 {
     char buffer[BUFSIZE];
@@ -337,7 +337,7 @@ int main(int argc, char** argv) {
 
                     case PROCESSING_PUT: 
                         fprintf(stderr,"In PROCESSING_PUT\n");
-                        put_operation(i,file_path,numbytes);
+                        put_operation(i,numbytes);
                         if(requestP[i].filesize == 0)
                         {
                             requestP[i].status = WAIT_FOR_OPERATION;
@@ -354,7 +354,7 @@ int main(int argc, char** argv) {
                         }
                         else
                         {
-                            get_operation(i,file_path);
+                            get_operation(i);
                         }
                         break;      
                         
@@ -487,7 +487,7 @@ int parsing_request(int conn_fd,request* reqP,char* filepath,char* filename)
 }
 
 
-void get_operation(int conn_fd,char* file_path)
+void get_operation(int conn_fd)
 {
     char buf[BUFSIZE];
     int fd = open(requestP[conn_fd].file_path,O_RDONLY);
@@ -505,7 +505,7 @@ void get_operation(int conn_fd,char* file_path)
     close(fd);
 }
 
-void put_operation(int conn_fd,char* file_path,ssize_t numbytes)
+void put_operation(int conn_fd,ssize_t numbytes)
 {
     FILE* received_file;
     received_file = fopen(requestP[conn_fd].file_path,"a");
